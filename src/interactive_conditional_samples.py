@@ -11,9 +11,9 @@ import model, sample, encoder
 def interact_model(
     model_name='124M',
     seed=None,
-    nsamples=1,#针对你输入的同一段提示词（Prompt），你希望模型总共为你生成多少个不同的结果。
+    nsamples=1,#针对你输入的同一段提示词（Prompt），希望模型总共为生成多少个不同的结果。
     batch_size=1,
-    length=None,#指的是模型生成的token的最大长度，与我输入的token的数量加起来不能超过n_ctx
+    length=None,#指的是模型生成的token的最大长度，与输入的token的数量加起来不能超过n_ctx
     temperature=1,
     top_k=0,
     top_p=1,
@@ -48,15 +48,15 @@ def interact_model(
     hparams = model.default_hparams()#加载模型默认超参数
     with open(os.path.join(models_dir, model_name, 'hparams.json')) as f:#打开models_dir/model_name/hparams.josn的目标路径
         hparams.override_from_dict(json.load(f))#json.load是把json文件转化为python的字典值
-#hparams.override_from_dict是先给一组默认值，然后用实际模型目录里的配置覆盖它，也就是json文件里面是模型真正的参数
+#hparams.override_from_dict是先给一组默认值，然后用实际模型目录里的配置覆盖它，也就是json文件里面是模型真正的参数，就是把json文件里面写的配置加载到参数里面
     if length is None:
         length = hparams.n_ctx // 2#如果不指定，就按最大上下文的一半来计
     elif length > hparams.n_ctx:
         raise ValueError("Can't get samples longer than window size: %s" % hparams.n_ctx)
     #生成一块计算图
     with tf.Session(graph=tf.Graph()) as sess:
-        context = tf.placeholder(tf.int32, [batch_size, None])#占位符
-        np.random.seed(seed)
+        context = tf.placeholder(tf.int32, [batch_size, None])#占位符,tf.int32 表示输入数据的类型是整数。[batch_size, None] 定义了输入数据的形状：第一维是一次处理的句子数量（批量大小），第二维是句子的长度，None 表示长度是动态可变的。
+        np.random.seed(seed)#固定np和tf的随机种子，这样有利于复现结果
         tf.set_random_seed(seed)
         output = sample.sample_sequence(
             hparams=hparams, length=length,
@@ -79,7 +79,7 @@ def interact_model(
             generated = 0
             for _ in range(nsamples // batch_size):
                 out = sess.run(output, feed_dict={#真正去运行程序
-                    context: [context_tokens for _ in range(batch_size)]
+                    context: [context_tokens for _ in range(batch_size)]#把刚刚的占位符填上数据
                 })[:, len(context_tokens):]
                 for i in range(batch_size):
                     generated += 1

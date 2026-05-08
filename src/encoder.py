@@ -4,7 +4,6 @@ import os
 import json
 import regex as re
 from functools import lru_cache
-#总结就是按照预先设定好的bpe规则，去分词，分完词之后去设定对应token_id
 @lru_cache()
 #把输入的字节转成对应的unicode字符
 def bytes_to_unicode():
@@ -18,7 +17,7 @@ def bytes_to_unicode():
     And avoids mapping to whitespace/control characters the bpe code barfs on.
     """
     #一个byte有8bit，共有256种结果，然后一个文字可能对应多个byte的组合，而每个byte对应的结果是固定的，类似acssic编码
-    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))#吧安全的byte编码先放进来，UTF-8 编码后的字节值，每个值范围是 0~255
+    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))#把安全的byte编码先放进来，UTF-8 编码后的字节值，每个值范围是 0~255
 
     cs = bs[:]
     n = 0
@@ -28,7 +27,7 @@ def bytes_to_unicode():
             bs.append(b)
             cs.append(2**8+n)
             n += 1
-    cs = [chr(n) for n in cs]
+    cs = [chr(n) for n in cs]#把数字code point 转成真正的Unicode字符
     return dict(zip(bs, cs))#最后出来的格式是，一个byte值，对应一个unicode
 
 def get_pairs(word):
@@ -50,68 +49,94 @@ class Encoder:
         self.errors = errors # how to handle errors in decoding
         self.byte_encoder = bytes_to_unicode()
         self.byte_decoder = {v:k for k, v in self.byte_encoder.items()}
-        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
-        self.cache = {}
+        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))#给BPE Merge规则编号，越靠前的merge,优先级越高，rank越小，就是把vocab_merger里的东西变成类似数组键值的东西，方便比较大小
+        self.cache = {}#已经encoder的在cache中找，不重复
 
         # Should haved added re.IGNORECASE so BPE merges can happen for capitalized versions of contractions
-        self.pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+        self.pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")#文本切分正则。它会把原始文本先切成一段一段的 token-like 片段。
 
-    def bpe(self, token):#这个BPE的作用是吧全部的字母合到合适的程度，不一定是整个单词，也不一定是一个一个字母，现在很好的开源
+
+
+    def bpe(self, token):
+        # 缓存机制：如果这个单词以前处理过，直接从字典里拿结果，提高速度
         if token in self.cache:
             return self.cache[token]
+        
+        # 初始化：把输入的单词拆成单个字符的元组。比如 'low' 变成 ('l', 'o', 'w')
         word = tuple(token)
+        # 获取当前字符序列中所有的相邻字符对。比如 ('l', 'o') 和 ('o', 'w')
         pairs = get_pairs(word)
 
         if not pairs:
             return token
 
+        # 不断寻找最优组合并合并，直到无法合并为止
         while True:
-            bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float('inf')))#在所有的pair里，找BPE优先级最好的pair
-            if bigram not in self.bpe_ranks:#如果当前所有的pair都不在merge列表中，就停止合并，这个bpe_ranks是预先处理好的存放在vocab.bpe中了
+            # 在当前所有的字符对(pairs)中，去预先训练好的 bpe_ranks 字典里查找。
+            # 找到 rank 值最小的（即优先级最高、在训练语料中最常出现的组合）。
+            bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float('inf')))
+            
+            # 如果当前找到的最优组合不在 bpe_ranks 里（说明所有的配对都不合法了），则停止合并
+            if bigram not in self.bpe_ranks:
                 break
+            
             first, second = bigram
             new_word = []
             i = 0
+            
+            # 合并：遍历当前的 word 元组，把所有的 first 和 second 合并成 first+second
             while i < len(word):
                 try:
+                    # 直接寻找下一个 first 出现的位置，跳过无关字符
                     j = word.index(first, i)
                     new_word.extend(word[i:j])
                     i = j
                 except:
+                    # 如果找不到了，说明剩下的字符里没有 first 了，把剩下的字符全部加进来，结束这轮遍历
                     new_word.extend(word[i:])
                     break
 
+                # 确认找到的 first 后面紧跟着的是不是 second
                 if word[i] == first and i < len(word)-1 and word[i+1] == second:
+                    # 如果是，就把它们拼起来当成一个新词根加进去
                     new_word.append(first+second)
-                    i += 2
+                    i += 2 # 因为合并了两个字符，所以索引往前跳 2 步
                 else:
+                    # 如果不是（比如只有 first，后面跟着的不是 second），就原样加进去
                     new_word.append(word[i])
                     i += 1
+                    
+            # 更新 word 为合并后的新元组
             new_word = tuple(new_word)
             word = new_word
+            
+            # 如果整个单词已经合并成了一个完整的词，就不需要再合了
             if len(word) == 1:
                 break
             else:
+                # 重新计算合并后的字符对，进入下一轮循环
                 pairs = get_pairs(word)
+                
+        # 格式化输出与缓存：把元组用空格连起来，比如 ('low', 'est') 变成 'low est'
         word = ' '.join(word)
         self.cache[token] = word
         return word
 
     def encode(self, text):
         bpe_tokens = []
-            # 步骤 1：正则预切分
+            # 正则预切分
 
         for token in re.findall(self.pat, text):
-            # 步骤 2：UTF-8 字节映射
+            # UTF-8 字节映射
             token = ''.join(self.byte_encoder[b] for b in token.encode('utf-8'))
-        # 步骤 3 & 4：BPE 合并 与 ID 查表
+        # BPE 合并 与 ID 查表
             bpe_tokens.extend(self.encoder[bpe_token] for bpe_token in self.bpe(token).split(' '))
         return bpe_tokens
 
     def decode(self, tokens):
-        # 步骤 1：ID 转字符串
+        # ID 转字符串
         text = ''.join([self.decoder[token] for token in tokens])
-        # 步骤 2 & 3：逆向字节映射 与 UTF-8 解码
+        #逆向字节映射 与 UTF-8 解码
         text = bytearray([self.byte_decoder[c] for c in text]).decode('utf-8', errors=self.errors)
         return text
 

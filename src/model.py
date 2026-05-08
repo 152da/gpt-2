@@ -11,11 +11,14 @@ def default_hparams():
         n_head=12,#头的数量
         n_layer=12,# Transformer 层的数量（Block数量）
     )
-
+#获取形状，动态静态均兼容
 def shape_list(x):
     """Deal with dynamic shape in tensorflow cleanly."""
+    
     static = x.shape.as_list()
+    
     dynamic = tf.shape(x)
+    
     return [dynamic[i] if s is None else s for i, s in enumerate(static)]
 #手写softmax，减去最大值，所有的指数项都被强制压缩在了0到1之间，防止套上指数之后爆炸
 def softmax(x, axis=-1):
@@ -30,14 +33,14 @@ def norm(x, scope, *, axis=-1, epsilon=1e-5):
     """Normalize to mean = 0, std = 1, then do a diagonal affine transform."""
     with tf.variable_scope(scope):
         n_state = x.shape[-1].value
-        g = tf.get_variable('g', [n_state], initializer=tf.constant_initializer(1))
-        b = tf.get_variable('b', [n_state], initializer=tf.constant_initializer(0))
+        g = tf.get_variable('g', [n_state], initializer=tf.constant_initializer(1))#定义可训练的参数
+        b = tf.get_variable('b', [n_state], initializer=tf.constant_initializer(0))#定义可训练的参数
         u = tf.reduce_mean(x, axis=axis, keepdims=True)# 计算均值
         s = tf.reduce_mean(tf.square(x-u), axis=axis, keepdims=True)# 计算方差
         x = (x - u) * tf.rsqrt(s + epsilon)# 归一化 (减去均值，除以标准差)
         x = x*g + b# 应用可学习的缩放和平移
         return x
-#多头注意力的分头，就是把一个长的向量切成短的向量去训练
+#多头注意力的分头，就是把一个长的向量切成短的向量去训练，比如把768切分成12个64的头去训练，每个头关注的重点不一样
 def split_states(x, n):
     """Reshape the last dimension of x into [n, x.shape[-1]/n]."""
     *start, m = shape_list(x)
@@ -50,13 +53,35 @@ def merge_states(x):
 #全连接层
 def conv1d(x, scope, nf, *, w_init_stdev=0.02):
     with tf.variable_scope(scope):
+        # 拆解输入张量的形状
+        # 假设输入 x 的形状是 [batch, seq_len, nx]
+        # start 会捕获前面的所有维度组成列表，即 [batch, seq_len]
+        # nx 会捕获最后一个维度，也就是当前的输入特征维度大小
         *start, nx = shape_list(x)
-        w = tf.get_variable('w', [1, nx, nf], initializer=tf.random_normal_initializer(stddev=w_init_stdev))
-        b = tf.get_variable('b', [nf], initializer=tf.constant_initializer(0))
-        c = tf.reshape(tf.matmul(tf.reshape(x, [-1, nx]), tf.reshape(w, [-1, nf]))+b, start+[nf])
+        
+        #  定义可训练的权重矩阵 W
+        # 形状为 [1, nx, nf]。这里的 '1' 是为了在逻辑上对齐一维卷积的核大小（kernel_size=1）。
+        # nx 是输入维度，nf 是我们想要的输出维度。
+        w = tf.get_variable('w', [1, nx, nf], 
+                            initializer=tf.random_normal_initializer(stddev=w_init_stdev))
+        
+        # 定义可训练的偏置向量 B
+        # 形状为 [nf]，即每一个输出维度对应一个偏置项，初始化为全 0。
+        b = tf.get_variable('b', [nf], 
+                            initializer=tf.constant_initializer(0))
+        
+        # 降维 -> 矩阵乘法 -> 升维恢复，达到全连接计算的效果
+        c = tf.reshape(
+            tf.matmul(
+                tf.reshape(x, [-1, nx]), 
+                tf.reshape(w, [-1, nf])
+            ) + b, 
+            start + [nf]
+        )
+        
         return c
 #生成一个下三角 mask，保证当前位置只能看自己和之前的位置，不能看未来。
-def attention_mask(nd, ns, *, dtype):
+def attention_mask(nd, ns, *, dtype):#nd: destination sequence length，当前要预测的位置数，ns: source sequence length，可被看的 key/value 长度
     """1's in the lower triangle, counting from the lower right corner.
 
     Same as tf.matrix_band_part(tf.ones([nd, ns]), -1, ns-nd), but doesn't produce garbage on TPUs.
@@ -64,7 +89,7 @@ def attention_mask(nd, ns, *, dtype):
     i = tf.range(nd)[:,None]
     j = tf.range(ns)
     m = i >= j - ns + nd
-    return tf.cast(m, dtype)
+    return tf.cast(m, dtype)#生成一个下三角1，0逻辑矩阵
 
 
 def attn(x, scope, n_state, *, past, hparams):
@@ -81,7 +106,7 @@ def attn(x, scope, n_state, *, past, hparams):
         # Reverse of split_heads
         return merge_states(tf.transpose(x, [0, 2, 1, 3]))
 #掩码机制
-    def mask_attn_weights(w):
+    def mask_attn_weights(w):#w的形状[batch, heads, dst_sequence, src_sequence]
         # w has shape [batch, heads, dst_sequence, src_sequence], where information flows from src to dst.
         _, _, nd, ns = shape_list(w)
         b = attention_mask(nd, ns, dtype=w.dtype)
@@ -93,7 +118,7 @@ def attn(x, scope, n_state, *, past, hparams):
         # q, k, v have shape [batch, heads, sequence, features]
         # 计算注意力分数: Q * K^T
         w = tf.matmul(q, k, transpose_b=True)
-        # 缩放 (Scale)：除以根号下维度大小，防止点积结果过大导致梯度消失
+        # 缩放 ：除以根号下维度大小，防止点积结果过大导致梯度消失
         w = w * tf.rsqrt(tf.cast(v.shape[-1].value, w.dtype))
         #掩码，遮蔽未来信息
         w = mask_attn_weights(w)
@@ -101,7 +126,7 @@ def attn(x, scope, n_state, *, past, hparams):
         # 转化为概率分布
         a = tf.matmul(w, v)# 乘以 V (Value) 得到最终的注意力输出
         return a
-
+#真正执行
     with tf.variable_scope(scope):
         c = conv1d(x, 'c_attn', n_state*3)
         q, k, v = map(split_heads, tf.split(c, 3, axis=2))#生成q，k，v矩阵，并劈成三份
@@ -123,11 +148,11 @@ def mlp(x, scope, n_state, *, hparams):
         h2 = conv1d(h, 'c_proj', nx)
         return h2
 
-# 这是一个完整的 Transformer Decoder 层 (Block)。
+#完整的 Transformer Decoder 层 (Block)。
 def block(x, scope, *, past, hparams):
     with tf.variable_scope(scope):
         nx = x.shape[-1].value
-        # Pre-LayerNorm 架构（GPT独有，与原始论文不同）：先做 LayerNorm，再做 Attention
+        # Pre-LayerNorm先做 LayerNorm，再做 Attention
         a, present = attn(norm(x, 'ln_1'), 'attn', nx, past=past, hparams=hparams)
         x = x + a
         #前馈神经网络
@@ -136,20 +161,66 @@ def block(x, scope, *, past, hparams):
         #输出结果
         return x, present
 
+
 def past_shape(*, hparams, batch_size=None, sequence=None):
-    return [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head]
+    """
+    定义 Transformer 中 KV Cache (键值缓存) 的 6 维张量形状。
+    主要用于在生成文本时，复用之前算好的 Key 和 Value，极大地加速推理过程。
+    
+    参数:
+        hparams: 模型的超参数对象 (包含层数 n_layer, 头数 n_head, 总维度 n_embd)
+        batch_size: 当前处理的批次大小
+        sequence: 历史缓存的序列长度 (已经生成了多少个词)
+        
+    返回:
+        一个包含 6 个元素的列表，代表 KV Cache 张量的完整形状:
+        [批次大小, 网络层数, 2(K和V), 注意力头数, 历史序列长度, 单个头的特征维度]
+    """
+    return [
+        batch_size, 
+        hparams.n_layer, 
+        2, 
+        hparams.n_head, 
+        sequence, 
+        hparams.n_embd // hparams.n_head
+    ]
+
 
 def expand_tile(value, size):
-    """Add a new axis of given size."""
+    """
+    在张量的最前面增加一个新维度 (axis=0)，并沿着这个新维度将数据复制 size 份。
+    
+    参数:
+        value: 需要被复制的原始张量 (比如位置序列 [5, 6])
+        size: 需要复制的份数 (通常是 batch_size)
+        
+    返回:
+        扩展且复制后的新张量
+    """
+    # 确保输入是一个 TensorFlow 张量
     value = tf.convert_to_tensor(value, name='value')
+    # 获取张量原本的维度数量 
     ndims = value.shape.ndims
     return tf.tile(tf.expand_dims(value, axis=0), [size] + [1]*ndims)
 
+
 def positions_for(tokens, past_length):
+    """
+    为当前输入的 token 序列生成对应的前向位置 ID，并扩展到整个 batch。
+    
+    参数:
+        tokens: 当前输入的词元张量，形状通常为 [batch_size, nsteps]
+        past_length: 过去已经处理并缓存的序列长度 (即偏移量)
+        
+    返回:
+        一个二维的张量，包含了 batch 中每个 token 的绝对位置 ID
+    """
+    # 获取批次大小 (batch_size) 和当前输入的序列长度 (nsteps)
     batch_size = tf.shape(tokens)[0]
     nsteps = tf.shape(tokens)[1]
-    return expand_tile(past_length + tf.range(nsteps), batch_size)
+    
 
+    return expand_tile(past_length + tf.range(nsteps), batch_size)
 #完整模型入口
 #X: token ids，形状 [batch, sequence]
 #past: 历史 KV cache，可选
